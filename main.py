@@ -1,77 +1,112 @@
+import glob
 import os
-import wave
 from pydub import AudioSegment
 from pydub.silence import detect_silence
+from pydub.silence import split_on_silence
 import torch
 import torchaudio
 from speechbrain.pretrained import EncoderClassifier
-from speechbrain.dataio.dataio import read_audio
-import speechbrain as sb
 import json
 import numpy as np
+from sklearn.cluster import KMeans
 
+def merge_channels(input_path,output_path):
+    sound = AudioSegment.from_file(input_path)
+    mono_sound = sound.set_channels(1)
+    mono_sound.export(output_path, format='wav')
 
-def audio_pipeline(wav):
-    sig = torchaudio.load(wav)
-    return sig
+def remove_record_silence(input_audio_path, mono_audio_path):
+    merge_channels(input_audio_path, mono_audio_path)
+    audio = AudioSegment.from_file(mono_audio_path)
+    segments = split_on_silence(audio, silence_thresh=-40, min_silence_len=1000)
+    silences = detect_silence(audio, min_silence_len=1000, silence_thresh=-40, seek_step=1)
+    new_audio = AudioSegment.silent(duration=0)
+    sound_number = 0
+    silence_number = 0
+    sound_dict = {}
 
+    output_folder = 'audio/SampleFlac'
+    os.makedirs(output_folder, exist_ok=True)
 
-# load sound file for segmenting
-sound = AudioSegment.from_file('Sample.wav')
-second_segment = sound[290032:463842]
+    for segment in segments:
+        if sound_number != 0:
+            new_audio = segment
+            output_file_path = os.path.join(output_folder, f'segment{sound_number}.wav')
+            new_audio.export(output_file_path, format='wav')
+            print(f'segment{sound_number} is saved')
+            sound_number += 1
+        else:
+            sound_number += 1
 
-# Detect the silence part of sound file
-silences = detect_silence(second_segment, min_silence_len=1000, silence_thresh=-35, seek_step=1)
-print(silences)
-print(silences[0][1])
-
-# Segmenting the sound segment
-temp_names = ["wave1.wav", "wave2.wav", "wave3.wav", "wave4.wav", "wave5.wav", "wave6.wav", "wave7.wav", "wave8.wav",
-              "wave9.wav", "wave10.wav"]
-sound_segment = sound[:silences[0][0]]
-sound_segment.export(temp_names[0], format='wav')
-sound_dicts = {
-    temp_names[0]: {
-        'start': 0,
-        'end': silences[0][0]
-    }
-}
-loop_counter = 0
-for silence in silences:
-    i = loop_counter
-    start = silences[i][1]
-    if i + 1 >= len(silences):
-        break
-    end = silences[i + 1][0]
-    print('This is ', i + 2, 'th segement: [', start, ',', end, ']')
-    loop_counter = loop_counter + 1
-    sound_segment = sound[start:end]
-    new_dict = {
-        temp_names[i + 1]: {
-            'start': start,
-            'end': end
+    for silence in silences:
+        i = silence_number
+        start = silences[i][1]
+        if i >= len(silences)-1:
+            break
+        end = silences[i+1][0]
+        silence_number = i + 1
+        new_dict = {
+            f"segment{i+1}": {
+                'start': start/1000,
+                'end': end/1000
+            }
         }
-    }
-    sound_dicts.update(**new_dict)
-    sound_segment.export(temp_names[i + 1], format='wav')
+        print(f"segment{i + 1}: start:{start/1000}, end:{end/1000}")
+        sound_dict.update(**new_dict)
+    sound_number = 0
 
-print(sound_dicts)
-with open('segments.json', 'w', encoding='utf-8') as f:
-    json.dump(sound_dicts, f, indent=4)
+    with open('segments.json', 'w', encoding='utf-8') as f:
+        json.dump(sound_dict, f, indent=4)
 
-# Loading pre-trained ECAPA-TDNN model
+# Use glob library to read all the audio files
+def get_audio_files(folder_path, allowed_extensions=['.wav', '.mp3', '.flac']):
+    audio_files = []
+    for ext in allowed_extensions:
+        audio_files.extend(glob.glob(os.path.join(folder_path, f'*{ext}')))
+
+    return audio_files
+
+# Segmenting the wav file by removing the silent part, recording information of sound
+# Loading the segmented sound file
+input_audio_path = 'SampleFlac.flac'
+mono_audio_path = 'audio/MonoAudio/monoaudio.wav '
+folder_path = 'audio/SampleFlac'
+remove_record_silence(input_audio_path,mono_audio_path)
+waveform, sample_rate = torchaudio.load('audio/SampleFlac/segment10.wav', normalize=True)
+
+print(f"Sample_rate_one_channel: {sample_rate} Hz")
+print(f"Waveform_one_channel: {waveform.shape}")
+
+audio_list = get_audio_files(folder_path)
+
+#Loading the pretrained model
 spk_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                            savedir="pretrained_models/spkrec-ecapa-voxceleb")
 
-audio_list = temp_names
+#Loading the segmented audio list and extracting features and save them as txt
+segment_counter = 0
 output_dir = "features"
-# index = torch.arange(192)
+features_list = []
+
 for audio in audio_list:
+    segment_counter += 1
     signal = torchaudio.load(audio)
     signal = signal[0]
     # signal = torch.index_select(signal,1,index=index)
     signal = torch.squeeze(signal)
     features = spk_model.encode_batch(signal)
     features_1d = torch.flatten(features)
-    output_path = os.path.join(output_dir, f"{os.path.splitext(audio)[0]}.txt")
+    features_list.append(features_1d)
+    output_path = os.path.join(output_dir, f"Segment_feature{segment_counter}.txt")
     np.savetxt(output_path, features_1d)
+
+all_features_array = np.vstack(features_list)
+
+num_classes = 4
+kmeans = KMeans(n_clusters=num_classes,random_state=42)
+kmeans.fit(all_features_array)
+
+predicted_labels = kmeans.labels_
+print("Predicted Labels: ", predicted_labels)
+print(len(predicted_labels))
+
